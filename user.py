@@ -1,80 +1,65 @@
-# user.py
-from ratchet import DoubleRatchet
-from crypto_utils import generate_dh_keypair, compute_shared_secret_hkdf
-from x3dh import compute_x3dh_shared_secret
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+import base64
 
+from crypto_utils import generate_dh_keypair, generate_signing_keypair, serialize_key, deserialize_x25519_pubkey
+from x3dh import PreKeyBundle, compute_x3dh_initiator, compute_x3dh_responder
+from ratchet import DoubleRatchet, RatchetMessage
+import logging
 
-def serialize_public_key(key):
-    return key.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
 class User:
-    def __init__(self, name):
+    def __init__(self, name: str):
         self.name = name
         self.ik_priv, self.ik_pub = generate_dh_keypair()
+        self.ik_sign_priv, self.ik_sign_pub = generate_signing_keypair()
         self.spk_priv, self.spk_pub = generate_dh_keypair()
+        self.spk_sig = self.ik_sign_priv.sign(self.spk_pub.public_bytes_raw())
         self.opk_priv, self.opk_pub = generate_dh_keypair()
         self.ephemeral_priv, self.ephemeral_pub = generate_dh_keypair()
-
-        self.ik_pub_bytes = serialize_public_key(self.ik_pub)
-        self.ephemeral_pub_bytes = serialize_public_key(self.ephemeral_pub)
-
         self.ratchet = None
 
     def publish_prekey_bundle(self):
-        return {
-            "identity_key": serialize_public_key(self.ik_pub),
-            "signed_prekey": serialize_public_key(self.spk_pub),
-            "one_time_prekey": serialize_public_key(self.opk_pub),
-        }
+        return PreKeyBundle(
+            identity_key=self.ik_pub,
+            identity_signing_key=self.ik_sign_pub,
+            signed_prekey=self.spk_pub,
+            signed_prekey_sig=self.spk_sig,
+            one_time_prekey=self.opk_pub
+        ).serialize()
 
-    def establish_session_as_initiator(self, peer_bundle: dict, peer_ik_pub: X25519PublicKey):
-        session_key = compute_x3dh_shared_secret(
-            self.ik_priv,
-            self.ephemeral_priv,
-            peer_bundle,
-            peer_ik_pub,
-            X25519PublicKey.from_public_bytes(peer_bundle["signed_prekey"]),
-            X25519PublicKey.from_public_bytes(peer_bundle["one_time_prekey"])
+    def establish_session_as_initiator(self, peer_bundle: dict):
+        bundle = PreKeyBundle.deserialize(peer_bundle)
+        root_key, chain_key, ik_signature = compute_x3dh_initiator(
+            self.ik_priv, self.ik_sign_priv, self.ephemeral_priv, bundle
         )
-
+        dh_pair = generate_dh_keypair()
         self.ratchet = DoubleRatchet(
-            root_key=session_key,
-            dh_pair=generate_dh_keypair(),
-            remote_dh_pub=X25519PublicKey.from_public_bytes(peer_bundle["signed_prekey"])
+            root_key=root_key,
+            dh_pair=dh_pair,
+            remote_dh_pub=dh_pair[1],  # Use own DH key initially; updated by first message
+            chain_key=chain_key
         )
-        return self.ephemeral_pub
+        logging.debug(f"Alice ratchet initialized: root_key={base64.b64encode(root_key).decode('utf-8')}")
+        return self.ephemeral_pub, self.ik_pub, self.ik_sign_pub, ik_signature
 
-    def establish_session_as_responder(self, peer_ik_pub, peer_epk_pub):
-        dh1 = self.spk_priv.exchange(peer_ik_pub)
-        dh2 = self.ik_priv.exchange(peer_epk_pub)
-        dh3 = self.spk_priv.exchange(peer_epk_pub)
-        dh4 = self.opk_priv.exchange(peer_epk_pub)
-        session_key = compute_shared_secret_hkdf(dh1 + dh2 + dh3 + dh4)
-
+    def establish_session_as_responder(self, peer_ik_pub, peer_ephemeral_pub):
+        root_key, chain_key = compute_x3dh_responder(
+            self.ik_priv, self.spk_priv, self.opk_priv,
+            peer_ik_pub, peer_ephemeral_pub
+        )
+        dh_pair = generate_dh_keypair()
         self.ratchet = DoubleRatchet(
-            root_key=session_key,
-            dh_pair=generate_dh_keypair(),
-            remote_dh_pub=peer_epk_pub
+            root_key=root_key,
+            dh_pair=dh_pair,
+            remote_dh_pub=dh_pair[1],  # Use own DH key initially; updated by first message
+            chain_key=chain_key
         )
+        logging.debug(f"Bob ratchet initialized: root_key={base64.b64encode(root_key).decode('utf-8')}")
+        return
 
-    def send_message(self, plaintext):
-        if isinstance(plaintext, str):
-            plaintext = plaintext.encode("utf-8")  # Only encode if it's a string
-        return self.ratchet.encrypt(plaintext)  # Now it's safe
+    def send_message(self, plaintext: str):
+        return self.ratchet.encrypt(plaintext.encode('utf-8'))
 
-    def receive_message(self, peer_dh_pub, ciphertext):
-        # Decrypt the message
-        decrypted_msg = self.ratchet.decrypt(peer_dh_pub, ciphertext)
-
-        # Attempt to decode the decrypted message as bytes, which may contain non-UTF-8 characters
-        try:
-            return decrypted_msg.decode('utf-8')
-        except UnicodeDecodeError:
-            print("Received raw message:", decrypted_msg)
-            # If UTF-8 decoding fails, just return the decrypted bytes as a fallback
-            return decrypted_msg
+    def receive_message(self, message: dict) -> str:
+        msg = self.ratchet.decrypt(RatchetMessage.deserialize(message))
+        return msg.decode('utf-8')

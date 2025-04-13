@@ -1,60 +1,74 @@
 import socket
-import pickle
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
-from cryptography.hazmat.primitives import serialization
+import json
+import base64
+import logging
 from user import User
+from crypto_utils import serialize_key
+import sys
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
 HOST = 'localhost'
 PORT = 65432
 
 alice = User("Alice")
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    s.connect((HOST, PORT))
-    print("[Alice] Connected to Bob.")
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((HOST, PORT))
+        print("[Alice] Connected to Bob.")
+        logging.debug("Connected to Bob")
 
-    # Step 1: Receive Bob's prekey bundle
-    bundle = pickle.loads(s.recv(4096))
-    bob_ik = X25519PublicKey.from_public_bytes(bundle["identity_key"])
-    print("[Alice] Received Bob's bundle. Establishing session...")
+        # Receive Bob’s prekey bundle
+        data = s.recv(4096).decode('utf-8')
+        if not data:
+            raise ValueError("No data received from Bob")
+        logging.debug(f"Received bundle data: {data}")
+        try:
+            bundle = json.loads(data)
+        except json.JSONDecodeError as e:
+            print(f"[Alice] Error decoding bundle: {e}")
+            logging.error(f"Error decoding bundle: {e}")
+            sys.exit(1)
+        print("[Alice] Received Bob’s bundle. Establishing session...")
+        logging.debug("Establishing session")
 
-    # Step 2: Establish session and get EPK
-    epk_pub = alice.establish_session_as_initiator(bundle, bob_ik)
+        # Establish session
+        epk_pub, ik_pub, ik_sign_pub, ik_signature = alice.establish_session_as_initiator(bundle)
 
-    # Step 3: Send Alice's identity and ephemeral public key (as bytes)
-    alice_ik_bytes = alice.ik_pub_bytes  # Assuming this is already in bytes
-    alice_epk_bytes = alice.ephemeral_pub_bytes  # Assuming this is already in bytes
-    s.sendall(pickle.dumps((alice_ik_bytes, alice_epk_bytes)))
+        # Send Alice’s IK, EPK, signing public key, and IK signature
+        init_data = {
+            "ik_pub": serialize_key(ik_pub),
+            "epk_pub": serialize_key(epk_pub),
+            "ik_sign_pub": serialize_key(ik_sign_pub),
+            "ik_signature": base64.b64encode(ik_signature).decode('utf-8')
+        }
+        logging.debug(f"Sending init_data: {init_data}")
+        s.sendall(json.dumps(init_data).encode('utf-8'))
 
-    # Step 4: Start chatting
-    while True:
-        msg = input("[Alice → Bob]: ")
-        encoded_msg = msg.encode("utf-8")
-        ciphertext = alice.send_message(encoded_msg)
+        # Chat loop
+        while True:
+            msg = input("[Alice → Bob]: ")
+            enc_msg = alice.send_message(msg)
+            logging.debug(f"Sending message: {enc_msg.serialize()}")
+            s.sendall(json.dumps(enc_msg.serialize()).encode('utf-8'))
 
-        # If `ciphertext` contains any cryptographic objects (like X25519PublicKey), ensure they are serialized
-        if isinstance(ciphertext, tuple):
-            # Assuming ciphertext contains (message, sender_dh), where sender_dh is X25519PublicKey
-            sender_dh = ciphertext[1]
-            sender_dh_bytes = sender_dh.public_bytes(
-                encoding=serialization.Encoding.Raw,  # To get raw bytes
-                format=serialization.PublicFormat.Raw  # To get the raw public key format
-            )
-
-            # Now we send the serialized data
-            s.sendall(pickle.dumps((ciphertext[0], sender_dh_bytes)))
-        else:
-            # If ciphertext is already ready to send (no complex objects), just send it
-            s.sendall(pickle.dumps(ciphertext))
-
-        enc_msg = s.recv(4096)
-        if not enc_msg:
-            break
-        ciphertext, sender_dh_bytes = pickle.loads(enc_msg)
-
-        # Deserialize the sender's DH public key
-        sender_dh = X25519PublicKey.from_public_bytes(sender_dh_bytes)
-
-        # Decrypt the message
-        plaintext = alice.receive_message(sender_dh, ciphertext)
-        print(f"\n[Bob → Alice]: {plaintext}")
+            data = s.recv(4096)
+            if not data:
+                print("[Alice] Connection closed by Bob")
+                logging.debug("Connection closed by Bob")
+                break
+            try:
+                reply = alice.receive_message(json.loads(data.decode('utf-8')))
+                print(f"[Alice ← Bob]: {reply}")
+                logging.debug(f"Received message: {reply}")
+            except json.JSONDecodeError as e:
+                print(f"[Alice] Error decoding message: {e}")
+                logging.error(f"Error decoding message: {e}")
+except ConnectionError as e:
+    print(f"[Alice] Connection error: {e}")
+    logging.error(f"Connection error: {e}")
+except Exception as e:
+    print(f"[Alice] Unexpected error: {str(e)}")
+    logging.error(f"Unexpected error: {str(e)}", exc_info=True)

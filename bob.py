@@ -1,65 +1,101 @@
 import socket
-import pickle
-
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
+import json
+import base64
+import logging
 from user import User
+from crypto_utils import serialize_key, deserialize_x25519_pubkey, verify_signature, deserialize_ed25519_pubkey
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
 HOST = 'localhost'
 PORT = 65432
 
-bob = User("Bob")
-bundle = bob.publish_prekey_bundle()
+def handle_client(conn, addr, bob):
+    """Handle a single client connection."""
+    try:
+        with conn:
+            print(f"[Bob] Connected by {addr}")
+            logging.debug(f"Connected by {addr}")
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    s.bind((HOST, PORT))
-    s.listen()
-    print("[Bob] Waiting for connection...")
-    conn, addr = s.accept()
-    with conn:
-        print(f"[Bob] Connected by {addr}")
+            # Send prekey bundle
+            bundle = bob.publish_prekey_bundle()
+            logging.debug(f"Sending bundle: {bundle}")
+            conn.sendall(json.dumps(bundle).encode('utf-8'))
 
-        # Step 1: Send Bob's prekey bundle
-        conn.sendall(pickle.dumps(bundle))
+            # Receive Alice’s IK, EPK, signing public key, and IK signature
+            data = conn.recv(4096).decode('utf-8')
+            if not data:
+                print("[Bob] No data received from Alice")
+                logging.debug("No data received from Alice")
+                return
 
-        # Step 2: Receive Alice's IK and EPK
-        init = conn.recv(4096)
-        alice_ik_bytes, alice_epk_bytes = pickle.loads(init)
-        alice_ik = X25519PublicKey.from_public_bytes(alice_ik_bytes)
-        alice_epk = X25519PublicKey.from_public_bytes(alice_epk_bytes)
-        print("[Bob] Received Alice's keys. Establishing session...")
-        bob.establish_session_as_responder(alice_ik, alice_epk)
+            try:
+                init_data = json.loads(data)
+                logging.debug(f"Received init_data: {init_data}")
+            except json.JSONDecodeError as e:
+                print(f"[Bob] Error decoding init data: {e}")
+                logging.error(f"Error decoding init data: {e}")
+                return
 
-        # Step 3: Chat loop
-        while True:
-            enc_msg = conn.recv(4096)
-            if not enc_msg:
-                break
-            ciphertext, sender_dh_bytes = pickle.loads(enc_msg)
+            alice_ik_pub = deserialize_x25519_pubkey(init_data["ik_pub"])
+            alice_epk_pub = deserialize_x25519_pubkey(init_data["epk_pub"])
+            alice_ik_sign_pub = deserialize_ed25519_pubkey(init_data["ik_sign_pub"])
+            alice_ik_sig = base64.b64decode(init_data["ik_signature"])
 
-            # Convert the sender's dh_pub from bytes back to X25519PublicKey
-            sender_dh = X25519PublicKey.from_public_bytes(sender_dh_bytes)
+            # Verify Alice’s IK signature using her Ed25519 signing key
+            if not verify_signature(alice_ik_sign_pub, alice_ik_pub.public_bytes_raw(), alice_ik_sig):
+                print("[Bob] Invalid Alice IK signature")
+                logging.debug("Invalid Alice IK signature")
+                return
 
-            # Decrypt the message
-            plaintext = bob.receive_message(sender_dh, ciphertext)
-            if isinstance(plaintext, bytes):
-                print(f"[Bob → Alice]: Received non-UTF-8 message. Treating as binary.")
-                print(f"Non-text message: {plaintext}")
-            else:
-                # Try to decode it as a UTF-8 string
+            print("[Bob] Received Alice’s keys. Establishing session...")
+            logging.debug("Establishing session")
+            bob.establish_session_as_responder(alice_ik_pub, alice_epk_pub)
+
+            # Chat loop
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    print("[Bob] Connection closed by Alice")
+                    logging.debug("Connection closed by Alice")
+                    break
                 try:
-                    print(f"[Bob → Alice]: {plaintext.decode('utf-8')}")
-                except UnicodeDecodeError:
-                    print(f"[Bob → Alice]: Failed to decode as UTF-8, treating as binary.")
+                    msg = bob.receive_message(json.loads(data.decode('utf-8')))
+                    print(f"[Bob ← Alice]: {msg}")
+                    logging.debug(f"Received message: {msg}")
+                except json.JSONDecodeError as e:
+                    print(f"[Bob] Error decoding message: {e}")
+                    logging.error(f"Error decoding message: {e}")
+                    continue
 
-            reply = input("[Bob → Alice]: ")
-            reply_ciphertext = bob.send_message(reply)
+                reply = input("[Bob → Alice]: ")
+                enc_msg = bob.send_message(reply)
+                logging.debug(f"Sending message: {enc_msg.serialize()}")
+                conn.sendall(json.dumps(enc_msg.serialize()).encode('utf-8'))
+    except ConnectionError as e:
+        print(f"[Bob] Connection error: {e}")
+        logging.error(f"Connection error: {e}")
+    except Exception as e:
+        print(f"[Bob] Unexpected error: {str(e)}")
+        logging.error(f"Unexpected error: {str(e)}", exc_info=True)
 
-            # Serialize the sender's public key before sending
-            reply_sender_dh_bytes = reply_ciphertext[1].public_bytes(
-                encoding=serialization.Encoding.Raw,  # To get raw bytes
-                format=serialization.PublicFormat.Raw  # To get the raw public key format
-            )
+def main():
+    bob = User("Bob")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((HOST, PORT))
+            s.listen()
+            print("[Bob] Waiting for connection...")
+            logging.debug("Waiting for connection")
+            conn, addr = s.accept()
+            handle_client(conn, addr, bob)
+    except ConnectionError as e:
+        print(f"[Bob] Connection error: {e}")
+        logging.error(f"Connection error: {e}")
+    except Exception as e:
+        print(f"[Bob] Unexpected error: {str(e)}")
+        logging.error(f"Unexpected error: {str(e)}", exc_info=True)
 
-            # Send the ciphertext and serialized sender's public key
-            conn.sendall(pickle.dumps((reply_ciphertext[0], reply_sender_dh_bytes)))
+if __name__ == "__main__":
+    main()
