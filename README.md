@@ -1,0 +1,1 @@
+An end-to-end encrypted communication between 2 parties which implements signal protocol features like double ratcheting and triple diffe hellman.
