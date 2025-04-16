@@ -1,101 +1,187 @@
 import socket
 import json
 import base64
+import threading
 import logging
+import time
 from user import User
-from crypto_utils import serialize_key, deserialize_x25519_pubkey, verify_signature, deserialize_ed25519_pubkey
+from crypto_utils import deserialize_x25519_pubkey, serialize_key
 
-# Set up logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
-HOST = 'localhost'
-PORT = 65432
-
-def handle_client(conn, addr, bob):
-    """Handle a single client connection."""
-    try:
-        with conn:
-            print(f"[Bob] Connected by {addr}")
-            logging.debug(f"Connected by {addr}")
-
-            # Send prekey bundle
-            bundle = bob.publish_prekey_bundle()
-            logging.debug(f"Sending bundle: {bundle}")
-            conn.sendall(json.dumps(bundle).encode('utf-8'))
-
-            # Receive Alice’s IK, EPK, signing public key, and IK signature
-            data = conn.recv(4096).decode('utf-8')
-            if not data:
-                print("[Bob] No data received from Alice")
-                logging.debug("No data received from Alice")
-                return
-
-            try:
-                init_data = json.loads(data)
-                logging.debug(f"Received init_data: {init_data}")
-            except json.JSONDecodeError as e:
-                print(f"[Bob] Error decoding init data: {e}")
-                logging.error(f"Error decoding init data: {e}")
-                return
-
-            alice_ik_pub = deserialize_x25519_pubkey(init_data["ik_pub"])
-            alice_epk_pub = deserialize_x25519_pubkey(init_data["epk_pub"])
-            alice_ik_sign_pub = deserialize_ed25519_pubkey(init_data["ik_sign_pub"])
-            alice_ik_sig = base64.b64decode(init_data["ik_signature"])
-
-            # Verify Alice’s IK signature using her Ed25519 signing key
-            if not verify_signature(alice_ik_sign_pub, alice_ik_pub.public_bytes_raw(), alice_ik_sig):
-                print("[Bob] Invalid Alice IK signature")
-                logging.debug("Invalid Alice IK signature")
-                return
-
-            print("[Bob] Received Alice’s keys. Establishing session...")
-            logging.debug("Establishing session")
-            bob.establish_session_as_responder(alice_ik_pub, alice_epk_pub)
-
-            # Chat loop
+def receive_messages(sock, bob, peer_name):
+    sock.settimeout(1.0)
+    while True:
+        try:
+            data = b""
             while True:
-                data = conn.recv(4096)
-                if not data:
-                    print("[Bob] Connection closed by Alice")
-                    logging.debug("Connection closed by Alice")
+                chunk = sock.recv(1024)
+                if not chunk:
+                    logging.debug("Receive socket closed")
                     break
-                try:
-                    msg = bob.receive_message(json.loads(data.decode('utf-8')))
-                    print(f"[Bob ← Alice]: {msg}")
-                    logging.debug(f"Received message: {msg}")
-                except json.JSONDecodeError as e:
-                    print(f"[Bob] Error decoding message: {e}")
-                    logging.error(f"Error decoding message: {e}")
-                    continue
+                data += chunk
+                if len(chunk) < 1024:
+                    break
+            if not data:
+                continue
+            msg = json.loads(data.decode('utf-8'))
+            sender = msg['sender']
+            if sender != peer_name:
+                continue
+            if 'x3dh_data' in msg:
+                epk_pub = deserialize_x25519_pubkey(msg['x3dh_data']['epk_pub'])
+                ik_pub = deserialize_x25519_pubkey(msg['x3dh_data']['ik_pub'])
+                used_opk = deserialize_x25519_pubkey(msg['x3dh_data']['used_opk'])
+                bob.establish_session_as_responder(peer_name, ik_pub, epk_pub, used_opk)
+            plaintext = bob.receive_message(peer_name, msg['message'])
+            print(f"\n[Bob ← {peer_name}]: {plaintext}")
+            logging.debug(f"Received message: {plaintext}")
+            print(f"[Bob → {peer_name}]: ", end="", flush=True)
+        except socket.timeout:
+            continue
+        except Exception as e:
+            logging.error(f"Receive error: {e}")
+            break
 
-                reply = input("[Bob → Alice]: ")
-                enc_msg = bob.send_message(reply)
-                logging.debug(f"Sending message: {enc_msg.serialize()}")
-                conn.sendall(json.dumps(enc_msg.serialize()).encode('utf-8'))
-    except ConnectionError as e:
-        print(f"[Bob] Connection error: {e}")
-        logging.error(f"Connection error: {e}")
-    except Exception as e:
-        print(f"[Bob] Unexpected error: {str(e)}")
-        logging.error(f"Unexpected error: {str(e)}", exc_info=True)
+def send_messages(sock, bob, peer_name):
+    sock.settimeout(15.0)  # Longer timeout for registration
+    # Register bundle
+    for attempt in range(3):
+        try:
+            logging.debug("Attempting to register bundle")
+            bundle_data = json.dumps({
+                "type": "register",
+                "user": bob.name,
+                "bundle": bob.publish_prekey_bundle()
+            }).encode('utf-8')
+            sock.sendall(bundle_data)
+            logging.debug(f"Sent bundle data length: {len(bundle_data)}")
+            data = sock.recv(1024)
+            resp = json.loads(data.decode('utf-8'))
+            logging.debug(f"Register response: {resp}")
+            if resp.get("status") == "OK":
+                print("[Bob] Successfully registered bundle")
+                break
+            else:
+                print(f"[Bob] Registration failed: {resp.get('message', 'Unknown error')}")
+        except socket.timeout:
+            logging.warning(f"Register attempt {attempt+1} timed out")
+            if attempt == 2:
+                print("[Bob] Warning: Failed to register bundle, continuing...")
+        except Exception as e:
+            logging.error(f"Register error: {e}")
+            if attempt == 2:
+                print("[Bob] Warning: Failed to register bundle, continuing...")
+        time.sleep(3)
+    sock.settimeout(1.0)  # Reset for messaging
+    time.sleep(1)  # Brief delay to ensure server readiness
+
+    while True:
+        try:
+            message = input(f"[Bob → {peer_name}]: ")
+            if message.lower() == "quit":
+                break
+            if message.lower() == "newkey":
+                bob.generate_new_keys()
+                for attempt in range(3):
+                    try:
+                        sock.sendall(json.dumps({
+                            "type": "newkey",
+                            "user": bob.name,
+                            "bundle": bob.publish_prekey_bundle()
+                        }).encode('utf-8'))
+                        data = sock.recv(1024)
+                        resp = json.loads(data.decode('utf-8'))
+                        logging.debug(f"Newkey response: {resp}")
+                        if resp.get("status") == "OK":
+                            print("[Bob] New keys registered")
+                            break
+                    except socket.timeout:
+                        logging.warning(f"Newkey attempt {attempt+1} timed out")
+                    except Exception as e:
+                        logging.error(f"Newkey error: {e}")
+                continue
+            # Get peer's bundle
+            sock.sendall(json.dumps({
+                "type": "get_bundle",
+                "target": peer_name
+            }).encode('utf-8'))
+            data = sock.recv(1024)
+            resp = json.loads(data.decode('utf-8'))
+            if not resp['bundle']:
+                print(f"[Bob] Message not sent: {peer_name} not registered")
+                time.sleep(2)
+                continue
+            # Establish or update session
+            if peer_name not in bob.ratchets:
+                x3dh_data = bob.establish_session_as_initiator(peer_name, resp['bundle'])
+            else:
+                x3dh_data = bob.update_session(peer_name, resp['bundle'])
+            if x3dh_data:
+                epk, ik, ik_sign, ik_sig, used_opk = x3dh_data
+                # Encrypt message
+                msg = bob.send_message(peer_name, message)
+                sock.sendall(json.dumps({
+                    "type": "message",
+                    "sender": bob.name,
+                    "recipient": peer_name,
+                    "message": msg.serialize(),
+                    "x3dh_data": {
+                        "epk_pub": base64.b64encode(epk.public_bytes_raw()).decode('utf-8'),
+                        "ik_pub": base64.b64encode(ik.public_bytes_raw()).decode('utf-8'),
+                        "ik_sign_pub": base64.b64encode(ik_sign.public_bytes_raw()).decode('utf-8'),
+                        "ik_signature": base64.b64encode(ik_sig).decode('utf-8'),
+                        "used_opk": serialize_key(used_opk)
+                    }
+                }).encode('utf-8'))
+                print(f"[Bob → {peer_name}]: {message}")
+                logging.debug(f"Sent message: {message}")
+        except socket.timeout:
+            continue
+        except Exception as e:
+            logging.error(f"Send error: {e}")
+            print(f"[Bob] Send error: {e}")
 
 def main():
     bob = User("Bob")
+    send_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    receive_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    peer_name = "Alice"
+
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind((HOST, PORT))
-            s.listen()
-            print("[Bob] Waiting for connection...")
-            logging.debug("Waiting for connection")
-            conn, addr = s.accept()
-            handle_client(conn, addr, bob)
-    except ConnectionError as e:
-        print(f"[Bob] Connection error: {e}")
-        logging.error(f"Connection error: {e}")
+        send_sock.connect(('127.0.0.1', 65432))
+        receive_sock.connect(('127.0.0.1', 65433))
+        logging.debug("Connected to server")
+
+        # Register receive socket
+        receive_sock.sendall(json.dumps({
+            "type": "register_receive",
+            "user": bob.name
+        }).encode('utf-8'))
+        logging.debug("Sent register_receive")
+
+        # Start threads
+        receive_thread = threading.Thread(
+            target=receive_messages,
+            args=(receive_sock, bob, peer_name),
+            daemon=True
+        )
+        send_thread = threading.Thread(
+            target=send_messages,
+            args=(send_sock, bob, peer_name),
+            daemon=True
+        )
+        receive_thread.start()
+        send_thread.start()
+        send_thread.join()
+
     except Exception as e:
-        print(f"[Bob] Unexpected error: {str(e)}")
-        logging.error(f"Unexpected error: {str(e)}", exc_info=True)
+        logging.error(f"Error: {e}")
+        print(f"[Bob] Error: {e}")
+    finally:
+        send_sock.close()
+        receive_sock.close()
+        logging.debug("Connections closed")
 
 if __name__ == "__main__":
     main()
