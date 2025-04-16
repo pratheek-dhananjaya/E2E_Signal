@@ -86,6 +86,11 @@ class Server:
                     logging.debug(f"Sent bundle for {user}")
                 elif msg['type'] == 'message':
                     recipient = msg['recipient']
+                    if "x3dh_data" in msg and not all(k in msg["x3dh_data"] for k in ["epk_pub", "ik_pub", "used_opk"]):
+                        logging.error(f"Invalid x3dh_data from {msg['sender']}")
+                        continue
+                    logging.debug(f"Received message from {msg['sender']} with x3dh_data: {'x3dh_data' in msg}")
+                    logging.debug(f"Message content: {msg['message']}")
                     with self.lock:
                         self.messages[recipient].append(msg)
                         logging.debug(f"Stored message for {recipient}")
@@ -94,7 +99,7 @@ class Server:
                                 json.dumps({
                                     "sender": msg["sender"],
                                     "message": msg["message"],
-                                    "x3dh_data": msg["x3dh_data"]
+                                    "x3dh_data": msg.get("x3dh_data", {})
                                 }).encode('utf-8')
                             )
                             logging.debug(f"Delivered message to {recipient}")
@@ -136,7 +141,7 @@ class Server:
                             json.dumps({
                                 "sender": m["sender"],
                                 "message": m["message"],
-                                "x3dh_data": m["x3dh_data"]
+                                "x3dh_data": m.get("x3dh_data", {})
                             }).encode('utf-8')
                         )
                         logging.debug(f"Sent queued message to {user}")
