@@ -5,6 +5,7 @@ import logging
 import os
 from collections import defaultdict
 from queue import Queue
+from socket import error as SocketError
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -59,7 +60,12 @@ class Server:
                     if len(chunk) < 1024:
                         break
                 logging.debug(f"Raw data length: {len(data)}")
-                msg = json.loads(data.decode('utf-8'))
+                try:
+                    msg = json.loads(data.decode('utf-8'))
+                except json.JSONDecodeError as e:
+                    logging.error(f"JSON error: {e}, data: {data}")
+                    sock.sendall(json.dumps({"status": "ERROR", "message": "Invalid JSON"}).encode('utf-8'))
+                    continue
                 logging.debug(f"Received send request: {msg['type']} from {addr}")
 
                 if msg['type'] == 'register':
@@ -95,16 +101,28 @@ class Server:
                         self.messages[recipient].append(msg)
                         logging.debug(f"Stored message for {recipient}")
                         if recipient in self.receive_sockets:
-                            self.receive_sockets[recipient].sendall(
-                                json.dumps({
-                                    "sender": msg["sender"],
-                                    "message": msg["message"],
-                                    "x3dh_data": msg.get("x3dh_data", {})
-                                }).encode('utf-8')
-                            )
-                            logging.debug(f"Delivered message to {recipient}")
+                            try:
+                                self.receive_sockets[recipient].sendall(
+                                    json.dumps({
+                                        "sender": msg["sender"],
+                                        "message": msg["message"],
+                                        "x3dh_data": msg.get("x3dh_data", {})
+                                    }).encode('utf-8') + b'\n'
+                                )
+                                logging.debug(f"Delivered message to {recipient}")
+                            except SocketError:
+                                logging.debug(f"Recipient {recipient} disconnected")
+                                del self.receive_sockets[recipient]
             except socket.timeout:
                 continue
+            except BrokenPipeError:
+                logging.debug(f"Client {addr} disconnected")
+                sock.close()
+                return
+            except SocketError as e:
+                logging.debug(f"Client {addr} disconnected: {e}")
+                sock.close()
+                return
             except json.JSONDecodeError as e:
                 logging.error(f"JSON error: {e}")
                 sock.sendall(json.dumps({"status": "ERROR", "message": "Invalid JSON"}).encode('utf-8'))
@@ -142,7 +160,7 @@ class Server:
                                 "sender": m["sender"],
                                 "message": m["message"],
                                 "x3dh_data": m.get("x3dh_data", {})
-                            }).encode('utf-8')
+                            }).encode('utf-8') + b'\n'
                         )
                         logging.debug(f"Sent queued message to {user}")
                     self.messages[user].clear()
