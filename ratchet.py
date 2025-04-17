@@ -39,14 +39,14 @@ class SymmetricRatchet:
     def _kdf_ck(self, chain_key: bytes) -> tuple[bytes, bytes]:
         chain_key_hmac = hmac.new(chain_key, b"\x01", hashlib.sha256).digest()
         message_key_hmac = hmac.new(chain_key, b"\x02", hashlib.sha256).digest()
-        logging.debug(f"Derived message_key={base64.b64encode(message_key_hmac).decode('utf-8')}")
+        # logging.debug(f"Derived message_key={base64.b64encode(message_key_hmac).decode('utf-8')}")
         return chain_key_hmac, message_key_hmac
 
     def update_chain_key(self, new_chain_key: bytes):
         with self.lock:
             self.chain_key = new_chain_key
             self.message_num = 0
-            logging.debug(f"Updated chain_key={base64.b64encode(self.chain_key).decode('utf-8')}")
+            # logging.debug(f"Updated chain_key={base64.b64encode(self.chain_key).decode('utf-8')}")
 
     def encrypt(self, plaintext: bytes) -> RatchetMessage:
         with self.lock:
@@ -59,7 +59,7 @@ class SymmetricRatchet:
                 n=self.message_num
             )
             self.message_num += 1
-            logging.debug(f"Encrypted: n={self.message_num-1}, associated_data={associated_data}")
+            # logging.debug(f"Encrypted: n={self.message_num-1}, associated_data={associated_data}")
             return message
 
     def decrypt(self, message: RatchetMessage) -> bytes:
@@ -68,5 +68,5 @@ class SymmetricRatchet:
             associated_data = f"{message.n}".encode('utf-8')
             plaintext = decrypt_message(message_key, message.ciphertext, message.nonce, associated_data)
             self.message_num = message.n + 1
-            logging.debug(f"Decrypted: n={message.n}, associated_data={associated_data}")
+            # logging.debug(f"Decrypted: n={message.n}, associated_data={associated_data}")
             return plaintext

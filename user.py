@@ -48,7 +48,7 @@ class User:
         }
         with open(self.key_file, 'w') as f:
             json.dump(data, f, indent=2)
-        logging.debug(f"{self.name} saved keys to {self.key_file}")
+        # logging.debug(f"{self.name} saved keys to {self.key_file}")
 
     def load_keys(self):
         try:

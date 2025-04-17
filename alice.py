@@ -1,6 +1,7 @@
 import socket
 import json
 import base64
+import sys
 import threading
 import logging
 import time
@@ -40,17 +41,17 @@ def receive_messages(sock, alice, peer_name):
             if not data:
                 continue
             data_str = data.decode('utf-8')
-            logging.debug(f"Raw received data: {data}")
+            # logging.debug(f"Raw received data: {data}")
             messages = parse_multiple_json(data_str)
             for msg in messages:
                 sender = msg['sender']
                 if sender != peer_name:
                     continue
-                logging.debug(f"Received x3dh_data: {msg['x3dh_data']}")
-                logging.debug(f"Received message: {msg['message']}")
-                logging.debug(f"Ratchet state: {alice.ratchets.get(peer_name)}")
-                logging.debug(f"Session exists for {peer_name}: {peer_name in alice.ratchets}")
-                logging.debug(f"Ratchet keys: {list(alice.ratchets.keys())}")
+                # logging.debug(f"Received x3dh_data: {msg['x3dh_data']}")
+                # logging.debug(f"Received message: {msg['message']}")
+                # logging.debug(f"Ratchet state: {alice.ratchets.get(peer_name)}")
+                # logging.debug(f"Session exists for {peer_name}: {peer_name in alice.ratchets}")
+                # logging.debug(f"Ratchet keys: {list(alice.ratchets.keys())}")
                 if peer_name not in alice.ratchets and not msg.get('x3dh_data'):
                     logging.debug(f"No session with {peer_name}, skipping until session established")
                     continue
@@ -76,13 +77,15 @@ def receive_messages(sock, alice, peer_name):
                     if message_n > expected_n:
                         logging.warning(f"Message n={message_n} too far ahead (expected n={expected_n}), skipping")
                         continue
+                    sys.stdout.write('\r\033[K')
+                    sys.stdout.flush()
                     plaintext = alice.receive_message(peer_name, msg['message'])
-                    print(f"\n[Alice ← {peer_name}]: {plaintext}")
-                    logging.debug(f"Received message: {plaintext}")
-                    if peer_name in alice.ratchets:
-                        logging.debug(f"Receive chain_key: {alice.ratchets[peer_name].chain_key}")
-                        logging.debug(f"Session key: {alice.ratchets[peer_name].root_key}")
-                    print(f"[Alice → {peer_name}]: ", end="", flush=True)
+                    print(f"[You ← {peer_name}]: {plaintext}")
+                    # logging.debug(f"Received message: {plaintext}")
+                    # if peer_name in alice.ratchets:
+                        # logging.debug(f"Receive chain_key: {alice.ratchets[peer_name].chain_key}")
+                        # logging.debug(f"Session key: {alice.ratchets[peer_name].root_key}")
+                    print(f"[You → {peer_name}]: ", end="", flush=True)
                 except InvalidTag as e:
                     logging.error(f"Authentication error: {e}", exc_info=True)
                     # Attempt to re-establish session
@@ -150,7 +153,7 @@ def send_messages(sock, alice, peer_name):
 
     while True:
         try:
-            message = input(f"[Alice → {peer_name}]: ")
+            message = input(f"[You → {peer_name}]: ")
             if message.lower() == "quit":
                 break
             if message.lower() == "newkey":
@@ -205,10 +208,10 @@ def send_messages(sock, alice, peer_name):
                     "used_opk": serialize_key(used_opk)
                 }
             sock.sendall(json.dumps(msg_data).encode('utf-8') + b'\n')
-            print(f"[Alice → {peer_name}]: {message}")
-            logging.debug(f"Sent message: {message}")
-            if peer_name in alice.ratchets:
-                logging.debug(f"Send chain_key: {alice.ratchets[peer_name].chain_key}")
+            # print(f"[You → {peer_name}]: {message}")
+            # logging.debug(f"Sent message: {message}")
+            # if peer_name in alice.ratchets:
+            #     logging.debug(f"Send chain_key: {alice.ratchets[peer_name].chain_key}")
         except socket.timeout:
             continue
         except Exception as e:
