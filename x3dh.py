@@ -42,8 +42,8 @@ def compute_x3dh_initiator(
     session_key = hkdf(combined, info=b"WhisperText", length=64)
     root_key, chain_key = session_key[:32], session_key[32:]
     ik_signature = ik_sign_priv.sign(combined)
-    logging.debug(f"Initiator combined: {base64.b64encode(combined).decode('utf-8')[:64]}...")
-    logging.debug(f"Initiator session_key: {base64.b64encode(session_key).decode('utf-8')}")
+    # logging.debug(f"Initiator combined: {base64.b64encode(combined).decode('utf-8')[:64]}...")
+    # logging.debug(f"Initiator session_key: {base64.b64encode(session_key).decode('utf-8')}")
     return root_key, chain_key, ik_signature
 
 def compute_x3dh_responder(
@@ -56,6 +56,6 @@ def compute_x3dh_responder(
     combined = b"\xFF" * 32 + dh1 + dh2 + dh3 + dh4
     session_key = hkdf(combined, info=b"WhisperText", length=64)
     root_key, chain_key = session_key[:32], session_key[32:]
-    logging.debug(f"Responder combined: {base64.b64encode(combined).decode('utf-8')[:64]}...")
-    logging.debug(f"Responder session_key: {base64.b64encode(session_key).decode('utf-8')}")
+    # logging.debug(f"Responder combined: {base64.b64encode(combined).decode('utf-8')[:64]}...")
+    # logging.debug(f"Responder session_key: {base64.b64encode(session_key).decode('utf-8')}")
     return root_key, chain_key

@@ -14,6 +14,7 @@ class Server:
         self.bundles = {}  # user -> prekey bundle
         self.messages = defaultdict(list)  # recipient -> list of messages
         self.receive_sockets = {}  # user -> receive socket
+        self.connected_users = set()  # Currently connected users
         self.lock = threading.Lock()
         self.key_file = "keys.txt"
         self.save_queue = Queue()
@@ -48,7 +49,6 @@ class Server:
         sock.settimeout(1.0)
         while True:
             try:
-                # Read full message
                 data = b""
                 while True:
                     chunk = sock.recv(1024)
@@ -133,44 +133,78 @@ class Server:
 
     def handle_receive(self, sock, addr):
         sock.settimeout(1.0)
-        try:
-            # Read full message
-            data = b""
-            while True:
-                chunk = sock.recv(1024)
-                if not chunk:
-                    logging.debug(f"Receive socket closed by {addr}")
-                    return
-                data += chunk
-                if len(chunk) < 1024:
-                    break
-            logging.debug(f"Raw receive data length: {len(data)}")
-            msg = json.loads(data.decode('utf-8'))
-            logging.debug(f"Received receive request: {msg['type']} from {addr}")
-            if msg['type'] == 'register_receive':
-                user = msg['user']
+        while True:
+            try:
+                data = b""
+                while True:
+                    chunk = sock.recv(1024)
+                    if not chunk:
+                        logging.debug(f"Receive socket closed by {addr}")
+                        with self.lock:
+                            for user, user_sock in list(self.receive_sockets.items()):
+                                if user_sock == sock:
+                                    del self.receive_sockets[user]
+                                    self.connected_users.discard(user)
+                                    logging.debug(f"Removed {user} from receive_sockets")
+                                    break
+                        sock.close()
+                        return
+                    data += chunk
+                    if len(chunk) < 1024:
+                        break
+                if not data:
+                    continue
+                logging.debug(f"Raw receive data length: {len(data)}")
+                msg = json.loads(data.decode('utf-8'))
+                logging.debug(f"Received receive request: {msg['type']} from {addr}")
+                if msg['type'] == 'register_receive':
+                    user = msg['user']
+                    is_reconnecting = user in self.connected_users
+                    with self.lock:
+                        if user in self.receive_sockets:
+                            old_sock = self.receive_sockets[user]
+                            try:
+                                old_sock.close()
+                            except:
+                                pass
+                        self.receive_sockets[user] = sock
+                        self.connected_users.add(user)
+                        logging.debug(f"Registered receive socket for {user}")
+                    if is_reconnecting:
+                        sock.sendall(json.dumps({
+                            "type": "reconnection_notification"
+                        }).encode('utf-8') + b'\n')
+                        logging.debug(f"Sent reconnection notification to {user}")
+                    with self.lock:
+                        for m in self.messages.get(user, []):
+                            sock.sendall(
+                                json.dumps({
+                                    "sender": m["sender"],
+                                    "message": m["message"],
+                                    "x3dh_data": m.get("x3dh_data", {})
+                                }).encode('utf-8') + b'\n'
+                            )
+                            logging.debug(f"Sent queued message to {user}")
+                        self.messages[user].clear()
+            except socket.timeout:
+                continue
+            except json.JSONDecodeError as e:
+                logging.error(f"Receive JSON error: {e}")
+                continue
+            except SocketError as e:
+                logging.debug(f"Receive socket error: {e}")
                 with self.lock:
-                    self.receive_sockets[user] = sock
-                    logging.debug(f"Registered receive socket for {user}")
-                # Send queued messages
-                with self.lock:
-                    for m in self.messages.get(user, []):
-                        sock.sendall(
-                            json.dumps({
-                                "sender": m["sender"],
-                                "message": m["message"],
-                                "x3dh_data": m.get("x3dh_data", {})
-                            }).encode('utf-8') + b'\n'
-                        )
-                        logging.debug(f"Sent queued message to {user}")
-                    self.messages[user].clear()
-        except socket.timeout:
-            pass
-        except json.JSONDecodeError as e:
-            logging.error(f"Receive JSON error: {e}")
-        except Exception as e:
-            logging.error(f"Receive error: {e}")
-        # Keep socket open
+                    for user, user_sock in list(self.receive_sockets.items()):
+                        if user_sock == sock:
+                            del self.receive_sockets[user]
+                            self.connected_users.discard(user)
+                            logging.debug(f"Removed {user} from receive_sockets")
+                            break
+                sock.close()
+                return
+            except Exception as e:
+                logging.error(f"Receive error: {e}")
+                continue
 
     def run(self):
         send_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -211,6 +245,9 @@ class Server:
             logging.info("Shutting down server")
             send_socket.close()
             receive_socket.close()
+            os.remove("keys.txt")
+            os.remove("Bob_keys.json")
+            os.remove("Alice_keys.json")
 
 if __name__ == "__main__":
     server = Server()

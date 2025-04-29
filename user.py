@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import socket
 from crypto_utils import generate_dh_keypair, generate_signing_keypair, serialize_key, deserialize_x25519_pubkey, deserialize_x25519_privkey, deserialize_ed25519_pubkey, deserialize_ed25519_privkey
 from x3dh import PreKeyBundle, compute_x3dh_initiator, compute_x3dh_responder
 from ratchet import SymmetricRatchet, RatchetMessage
@@ -22,6 +23,8 @@ class User:
             self.spk_sig = self.ik_sign_priv.sign(self.spk_pub.public_bytes_raw())
             self.opk_pairs = [generate_dh_keypair() for _ in range(10)]  # 10 one-time prekeys
             self.save_keys()
+        logging.debug(f"{self.name} OPK count on init: {len(self.opk_pairs)}")
+        self.check_and_replenish_opks(threshold=10, target=10)  # Force replenish on init
 
     def save_keys(self):
         data = {
@@ -48,7 +51,7 @@ class User:
         }
         with open(self.key_file, 'w') as f:
             json.dump(data, f, indent=2)
-        # logging.debug(f"{self.name} saved keys to {self.key_file}")
+        logging.debug(f"{self.name} saved keys to {self.key_file}")
 
     def load_keys(self):
         try:
@@ -85,6 +88,42 @@ class User:
             self.opk_pairs = [generate_dh_keypair() for _ in range(10)]
             self.ratchets = {}
 
+    def check_and_replenish_opks(self, threshold=10, target=10):
+        """Replenish one-time prekeys, always replacing one OPK."""
+        logging.debug(f"{self.name} checking OPKs: current count={len(self.opk_pairs)}, threshold={threshold}")
+        if len(self.opk_pairs) > 0:
+            self.opk_pairs.pop(0)  # Remove oldest OPK
+            logging.debug(f"{self.name} removed oldest OPK")
+        if len(self.opk_pairs) < target:
+            new_opks = [generate_dh_keypair() for _ in range(target - len(self.opk_pairs))]
+            self.opk_pairs.extend(new_opks)
+            self.save_keys()
+            logging.debug(f"{self.name} replenished {len(new_opks)} OPKs")
+            self.publish_new_bundle()
+
+    def publish_new_bundle(self):
+        """Publish updated prekey bundle to server."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect(('127.0.0.1', 65432))
+            bundle_data = json.dumps({
+                "type": "newkey",
+                "user": self.name,
+                "bundle": self.publish_prekey_bundle()
+            }).encode('utf-8')
+            sock.sendall(bundle_data + b'\n')
+            data = sock.recv(1024)
+            resp = json.loads(data.decode('utf-8'))
+            if resp.get("status") == "OK":
+                logging.debug(f"{self.name} successfully published new bundle")
+            else:
+                logging.error(f"{self.name} failed to publish new bundle: {resp}")
+        except Exception as e:
+            logging.error(f"{self.name} failed to publish new bundle: {e}")
+        finally:
+            sock.close()
+
     def publish_prekey_bundle(self):
         return PreKeyBundle(
             identity_key=self.ik_pub,
@@ -103,10 +142,11 @@ class User:
         self.ratchets.clear()
         self.save_keys()
         logging.debug(f"{self.name} generated new keys")
+        self.publish_new_bundle()
 
     def establish_session_as_initiator(self, peer_name: str, peer_bundle: dict):
         if peer_name in self.ratchets:
-            return None  # Session already exists
+            return None
         bundle = PreKeyBundle.deserialize(peer_bundle)
         ek_priv, ek_pub = generate_dh_keypair()
         root_key, chain_key, ik_signature = compute_x3dh_initiator(
@@ -114,13 +154,12 @@ class User:
         )
         self.ratchets[peer_name] = SymmetricRatchet(root_key, chain_key)
         self.save_keys()
-        logging.debug(f"{self.name} initialized ratchet for {peer_name}")
+        logging.debug(f"{self.name} established initiator session with {peer_name}")
         return ek_pub, self.ik_pub, self.ik_sign_pub, ik_signature, bundle.one_time_prekeys[0] if bundle.one_time_prekeys else None
 
     def establish_session_as_responder(self, peer_name: str, peer_ik_pub, peer_ek_pub, used_opk_pub):
         if peer_name in self.ratchets:
-            return  # Session already exists
-        logging.debug(f"Available OPKs: {[opk_pub.public_bytes_raw() for _, opk_pub in self.opk_pairs]}")
+            return
         opk_priv = None
         opk_index = -1
         if used_opk_pub:
@@ -131,18 +170,16 @@ class User:
                     break
             if opk_priv is None:
                 logging.warning(f"No matching OPK for {peer_name}, using IK and SPK only")
-        else:
-            logging.debug(f"No OPK provided for {peer_name}, using IK and SPK only")
         root_key, chain_key = compute_x3dh_responder(
             self.ik_priv, self.spk_priv, opk_priv, peer_ik_pub, peer_ek_pub
         )
         self.ratchets[peer_name] = SymmetricRatchet(root_key, chain_key)
         if opk_index != -1:
-            self.opk_pairs.pop(opk_index)  # Remove used one-time prekey
+            self.opk_pairs.pop(opk_index)
             logging.debug(f"{self.name} removed OPK at index {opk_index}")
+        self.check_and_replenish_opks(threshold=10, target=10)
         self.save_keys()
-        logging.debug(f"{self.name} initialized ratchet for {peer_name}")
-        logging.debug(f"Session for {peer_name}: {peer_name in self.ratchets}")
+        logging.debug(f"{self.name} established responder session with {peer_name}")
 
     def update_session(self, peer_name: str, peer_bundle: dict):
         bundle = PreKeyBundle.deserialize(peer_bundle)
@@ -168,3 +205,11 @@ class User:
         msg = self.ratchets[peer_name].decrypt(RatchetMessage.deserialize(message))
         self.save_keys()
         return msg.decode('utf-8')
+
+    def refresh_session(self, peer_name: str):
+        if peer_name in self.ratchets:
+            del self.ratchets[peer_name]
+            self.save_keys()
+            logging.debug(f"{self.name} refreshed ratchet for {peer_name}")
+            return True
+        return False

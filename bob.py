@@ -34,24 +34,24 @@ def receive_messages(sock, bob, peer_name):
                 chunk = sock.recv(1024)
                 if not chunk:
                     logging.debug("Receive socket closed")
-                    break
+                    return
                 data += chunk
                 if len(chunk) < 1024:
                     break
             if not data:
                 continue
             data_str = data.decode('utf-8')
-            # logging.debug(f"Raw received data: {data}")
             messages = parse_multiple_json(data_str)
             for msg in messages:
+                if msg.get('type') == 'reconnection_notification':
+                    logging.debug("Received reconnection notification")
+                    if peer_name in bob.ratchets:
+                        del bob.ratchets[peer_name]
+                        logging.debug(f"Cleared session for {peer_name} due to reconnection")
+                    continue
                 sender = msg['sender']
                 if sender != peer_name:
                     continue
-                # logging.debug(f"Received x3dh_data: {msg['x3dh_data']}")
-                # logging.debug(f"Received message: {msg['message']}")
-                # logging.debug(f"Ratchet state: {bob.ratchets.get(peer_name)}")
-                # logging.debug(f"Session exists for {peer_name}: {peer_name in bob.ratchets}")
-                # logging.debug(f"Ratchet keys: {list(bob.ratchets.keys())}")
                 if peer_name not in bob.ratchets and not msg.get('x3dh_data'):
                     logging.debug(f"No session with {peer_name}, skipping until session established")
                     continue
@@ -81,14 +81,9 @@ def receive_messages(sock, bob, peer_name):
                     sys.stdout.flush()
                     plaintext = bob.receive_message(peer_name, msg['message'])
                     print(f"[You ← {peer_name}]: {plaintext}")
-                    # logging.debug(f"Received message: {plaintext}")
-                    # if peer_name in bob.ratchets:
-                    #     logging.debug(f"Receive chain_key: {bob.ratchets[peer_name].chain_key}")
-                    #     logging.debug(f"Session key: {bob.ratchets[peer_name].root_key}")
                     print(f"[You → {peer_name}]: ", end="", flush=True)
                 except InvalidTag as e:
                     logging.error(f"Authentication error: {e}", exc_info=True)
-                    # Attempt to re-establish session
                     temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     try:
                         temp_sock.connect(('127.0.0.1', 65432))
@@ -109,6 +104,9 @@ def receive_messages(sock, bob, peer_name):
                     continue
         except socket.timeout:
             continue
+        except OSError as e:
+            logging.error(f"Socket error: {e}", exc_info=True)
+            return
         except ValueError as e:
             logging.error(f"Key deserialization error: {e}", exc_info=True)
             continue
@@ -120,7 +118,7 @@ def receive_messages(sock, bob, peer_name):
             continue
 
 def send_messages(sock, bob, peer_name):
-    sock.settimeout(15.0)  # Longer timeout for registration
+    sock.settimeout(15.0)
     for attempt in range(3):
         try:
             logging.debug("Attempting to register bundle")
@@ -148,7 +146,7 @@ def send_messages(sock, bob, peer_name):
             if attempt == 2:
                 print("[Bob] Warning: Failed to register bundle, continuing...")
         time.sleep(3)
-    sock.settimeout(1.0)  # Reset for messaging
+    sock.settimeout(1.0)
     time.sleep(1)
 
     while True:
@@ -189,7 +187,6 @@ def send_messages(sock, bob, peer_name):
             x3dh_data = None
             if peer_name not in bob.ratchets:
                 x3dh_data = bob.establish_session_as_initiator(peer_name, resp['bundle'])
-                logging.debug(f"New session established for {peer_name}")
             msg = bob.send_message(peer_name, message)
             msg_data = {
                 "type": "message",
@@ -199,7 +196,6 @@ def send_messages(sock, bob, peer_name):
             }
             if x3dh_data:
                 epk, ik, ik_sign, ik_sig, used_opk = x3dh_data
-                logging.debug(f"Sending x3dh_data: {epk.public_bytes_raw(), ik.public_bytes_raw(), used_opk.public_bytes_raw()}")
                 msg_data["x3dh_data"] = {
                     "epk_pub": base64.b64encode(epk.public_bytes_raw()).decode('utf-8'),
                     "ik_pub": base64.b64encode(ik.public_bytes_raw()).decode('utf-8'),
@@ -208,10 +204,6 @@ def send_messages(sock, bob, peer_name):
                     "used_opk": serialize_key(used_opk)
                 }
             sock.sendall(json.dumps(msg_data).encode('utf-8') + b'\n')
-            # print(f"[You → {peer_name}]: {message}")
-            # logging.debug(f"Sent message: {message}")
-            # if peer_name in bob.ratchets:
-                # logging.debug(f"Send chain_key: {bob.ratchets[peer_name].chain_key}")
         except socket.timeout:
             continue
         except Exception as e:
@@ -254,7 +246,10 @@ def main():
         print(f"[Bob] Error: {e}")
     finally:
         send_sock.close()
-        receive_sock.close()
+        try:
+            receive_sock.close()
+        except:
+            pass
         logging.debug("Connections closed")
 
 if __name__ == "__main__":

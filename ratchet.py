@@ -34,7 +34,7 @@ class SymmetricRatchet:
         self.chain_key = chain_key
         self.message_num = 0
         self.lock = threading.Lock()
-        logging.debug(f"Initialized ratchet: root_key={base64.b64encode(root_key).decode('utf-8')[:32]}..., chain_key={base64.b64encode(chain_key).decode('utf-8')}")
+        # logging.debug(f"Initialized ratchet: root_key={base64.b64encode(root_key).decode('utf-8')[:32]}..., chain_key={base64.b64encode(chain_key).decode('utf-8')}")
 
     def _kdf_ck(self, chain_key: bytes) -> tuple[bytes, bytes]:
         chain_key_hmac = hmac.new(chain_key, b"\x01", hashlib.sha256).digest()
